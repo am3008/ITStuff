@@ -1,0 +1,176 @@
+
+import socket
+import json
+import random
+import datetime
+import hashlib
+import sys
+
+expired_sessions = {}
+
+def start_server(ip, port, accounts_file, session_timeout, root_dir):
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((ip, port))
+    server_socket.listen(5)
+
+    with open(accounts_file, 'r') as f:
+        accounts = json.load(f)
+
+    sessions = {}
+
+    try:
+        while True:
+            client_socket, addr = server_socket.accept()
+            handle_client(client_socket, accounts, sessions, session_timeout, root_dir)
+    except Exception as error:
+        log_event(f"Server error: {type(error).__name__}")
+
+def handle_client(client_socket, accounts, sessions, session_timeout, root_dir):
+    check_expired_sessions(sessions)
+    request = client_socket.recv(1024).decode()
+    headers, _ = request.split('\r\n\r\n', 1)
+
+    request_line, *header_lines = headers.split('\r\n')
+    method, path, _ = request_line.split()
+    try:
+        if method == 'POST':
+            handle_post_request(client_socket, path, header_lines, accounts, sessions, session_timeout)
+        elif method == 'GET':
+            handle_get_request(client_socket, path, header_lines, sessions, root_dir, session_timeout)
+        else:
+            log_event("Unsupported method: {method}")
+    except Exception as error:
+        log_event(f"Client handling error: {type(error).__name__}")
+    finally:
+        client_socket.close()
+
+def handle_post_request(client_socket, path, headers, accounts, sessions, session_timeout):
+    try:
+        credentials = {header.split(": ")[0].lower(): header.split(": ")[1] for header in headers if ": " in header}
+        username = credentials.get('username')
+        password = credentials.get('password')
+
+        if not username or not password:
+            send_response(client_socket, '501 Not Implemented', 'Login failed! Missing username or password')
+            log_event("LOGIN FAILED")
+        elif username in accounts and verify_password(password, accounts[username]):
+            sessionID = create_session(sessions, username, session_timeout)
+            send_response(client_socket, '200 OK', 'Logged in!', {'Set-Cookie': f'sessionID={sessionID}; HttpOnly'})
+            log_event(f"LOGIN SUCCESSFUL: {username} : {password}")
+        else:
+            send_response(client_socket, '200 OK', 'Login failed!')
+            log_event(f"LOGIN FAILED: {username} : {password}")
+    except Exception as error:
+        send_response(client_socket, '500 Internal Server Error', 'Internal server error')
+        log_event(f"Client handling error: {type(error).__name__}")
+
+def parse_post_data(body):
+    return dict(pair.split('=') for pair in body.split('&'))
+
+def verify_password(provided_password, stored_password):
+    stored_password_hash = stored_password[0]
+    salt = stored_password[1]
+    computed_hash = hashlib.sha256(provided_password.encode() + salt.encode()).hexdigest()
+    return computed_hash == stored_password_hash
+
+
+def create_session(sessions, username, session_timeout):
+    session_id = hex(random.getrandbits(64))[2:]
+    sessions[session_id] = {'username': username, 'expiry': datetime.datetime.now() + datetime.timedelta(seconds=session_timeout)}
+    return session_id
+
+
+def handle_get_request(client_socket, path, header_lines, sessions, root_dir, session_timeout):
+    cookies = parse_cookies(header_lines)
+    session_id = cookies.get('sessionID')
+
+    if session_id:
+        if session_id in sessions:
+            if is_session_active(sessions, session_id):
+                username = sessions[session_id]['username']
+                sessions[session_id]['expiry'] = datetime.datetime.now() + datetime.timedelta(seconds=session_timeout)
+
+                if serve_file(client_socket, path, username, root_dir):
+                    log_event("GET SUCCEEDED", username, path)
+                else:
+                    send_response(client_socket, '404 Not Found', 'File not found')
+                    log_event("GET FAILED", username, path)
+            else:
+                send_response(client_socket, '401 Unauthorized', 'Session expired')
+                log_event("SESSION EXPIRED", path)
+        elif session_id in expired_sessions:
+            send_response(client_socket, '401 Unauthorized', 'Session expired')
+            log_event("SESSION EXPIRED", path)
+        else:
+            send_response(client_socket, '401 Unauthorized', 'Invalid cookie: session ID not recognized')
+            log_event("COOKIE INVALID", path)
+    else:
+        send_response(client_socket, '401 Unauthorized', 'Missing session ID in cookies')
+
+
+
+def parse_cookies(header_lines):
+    cookies = {}
+    for line in header_lines:
+        if line.startswith('Cookie:'):
+            _, cookie_string = line.split(':', 1)
+            cookies.update(dict(pair.strip().split('=') for pair in cookie_string.split(';') if '=' in pair))
+    return cookies
+
+
+def is_session_active(sessions, session_id):
+    return datetime.datetime.now() < sessions[session_id]['expiry']
+
+def serve_file(client_socket, path, username, root_dir):
+    file_path = f"{root_dir}/{username}/{path.lstrip('/')}"
+    if file_path.startswith(f"{root_dir}/{username}/"):
+        try:
+            with open(file_path, 'rb') as file:
+                file_content = file.read()
+                send_response(client_socket, '200 OK', file_content, {'Content-Type': 'text/plain'})
+                return True
+        except FileNotFoundError:
+            send_response(client_socket, '404 Not Found', 'File not found')
+    else:
+        send_response(client_socket, '403 Forbidden', 'Access denied')
+    return False
+
+def send_response(client_socket, status, content, headers=None):
+    response = f'HTTP/1.0 {status}\r\n'
+    if headers:
+        for key, value in headers.items():
+            response += f'{key}: {value}\r\n'
+    response += '\r\n'
+    if isinstance(content, str):
+        response += content
+    client_socket.send(response.encode())
+    if isinstance(content, bytes):
+        client_socket.send(content)
+
+def check_expired_sessions(sessions):
+    curr_time = datetime.datetime.now()
+    for session_id in list(sessions.keys()):
+        if curr_time > sessions[session_id]['expiry']:
+            expired_sessions[session_id] = sessions[session_id]
+            del sessions[session_id]
+
+def log_event(event, username=None, target=None):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    message = f"SERVER LOG: {timestamp} {event}"
+    if username:
+        message += f": {username}"
+    if target:
+        message += f" : {target}"
+    print(message)
+
+
+if __name__ == "__main__":
+
+    IP = sys.argv[1]
+    PORT = int(sys.argv[2])
+    ACCOUNTS_FILE = sys.argv[3]
+    SESSION_TIMEOUT = int(sys.argv[4])
+    ROOT_DIR = sys.argv[5]
+
+    start_server(IP, PORT, ACCOUNTS_FILE, SESSION_TIMEOUT, ROOT_DIR)
