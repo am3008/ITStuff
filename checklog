@@ -1,0 +1,68 @@
+#!/usr/bin/python3
+
+import sys
+import hashlib
+import base64
+
+log_filename = "log.txt"
+loghead_filename = "loghead.txt"
+
+def check_log():
+    try:
+        with open(loghead_filename, "r") as head_file:
+            expected_hash = head_file.read().strip()
+    except FileNotFoundError:
+        print("failed: loghead.txt is missing")
+        sys.exit(1)
+
+    try:
+        with open(log_filename, "r") as log_file:
+            lines = log_file.readlines()
+    except FileNotFoundError:
+        print("failed: log.txt is missing")
+        sys.exit(1)
+
+ 
+    lines = [line.rstrip('\n') for line in lines]
+
+    for i in range(len(lines) - 1):
+        line = lines[i]
+        next_line = lines[i + 1]
+
+
+        hash_obj = hashlib.sha256(line.encode())
+        computed_hash = base64.b64encode(hash_obj.digest()).decode()
+
+
+        parts = next_line.split(" - ")
+        if len(parts) > 1:
+            recorded_hash = parts[1].split(' ', 1)[0]
+        else:
+            print(f"log format error at line {i+2}")
+            sys.exit(1)
+
+        if computed_hash != recorded_hash:
+            print(f"failed: corruption detected at line {i+1}")
+            print(f"expected: {recorded_hash}")
+            print(f"found: {computed_hash}")
+            sys.exit(1)
+
+    last_line = lines[-1]
+    hash_obj = hashlib.sha256(last_line.encode())
+    last_computed_hash = base64.b64encode(hash_obj.digest()).decode()
+    
+    if last_computed_hash != expected_hash:
+        print(f"failed: corruption detected at the last entry")
+        print(f"expected: {expected_hash}")
+        print(f"found: {last_computed_hash}")
+        sys.exit(1)
+
+    print("valid")
+    sys.exit(0)
+
+
+if len(sys.argv) > 1:
+    print("Usage: checklog")
+    sys.exit(1)
+
+check_log()

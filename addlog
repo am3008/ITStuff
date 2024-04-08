@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+
+import sys
+import hashlib
+import base64
+from datetime import datetime
+
+log_filename = "log.txt"
+loghead_filename = "loghead.txt"
+
+def add_log(log_string):
+    log_string = log_string.replace("\n", " ")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with open(loghead_filename, "r") as head_file:
+            last_hash = head_file.read().strip()
+    except FileNotFoundError:
+        last_hash = "begin"
+
+    log_entry = f"{timestamp} - {last_hash} {log_string}\n"
+
+    with open(log_filename, "a") as log_file:
+        log_file.write(log_entry)
+
+    hash_obj = hashlib.sha256(log_entry[:-1].encode())
+    entry_hash = base64.b64encode(hash_obj.digest()).decode()
+
+    with open(loghead_filename, "w") as head_file:
+        head_file.write(entry_hash)
+
+if len(sys.argv) != 2:
+    print("usage: addlog log_string")
+    sys.exit(1)
+
+add_log(sys.argv[1])
+
+print("log entry added successfully")
